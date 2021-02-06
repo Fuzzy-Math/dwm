@@ -56,6 +56,7 @@
 #define HEIGHT(X)               ((X)->h + 2 * (X)->bw)
 #define TAGMASK                 ((1 << LENGTH(tags)) - 1)
 #define TEXTW(X)                (drw_fontset_getwidth(drw, (X)) + lrpad)
+#define PERTAG_PATCH 1
 
 /* enums */
 enum { CurNormal, CurResize, CurMove, CurLast }; /* cursor */
@@ -111,6 +112,8 @@ typedef struct {
 	void (*arrange)(Monitor *);
 } Layout;
 
+typedef struct Pertag Pertag;
+
 struct Monitor {
 	char ltsymbol[16];
 	float mfact;
@@ -134,6 +137,7 @@ struct Monitor {
 	Monitor *next;
 	Window barwin;
 	const Layout *lt[2];
+	Pertag *pertag;
 };
 
 typedef struct {
@@ -207,6 +211,14 @@ static void setfullscreen(Client *c, int fullscreen);
 static void setgaps(int gapw);
 static void incrgaps(const Arg *arg);
 static void defaultgaps(const Arg *arg);
+static void togglegaps(const Arg *arg);
+static void bstack(Monitor *m);
+static void bstackhoriz(Monitor *m);
+static void centeredmaster(Monitor *m);
+static void centeredfloatingmaster(Monitor *m);
+static void deck(Monitor *m);
+static void getgaps(Monitor *m, int *oh, int *ov, int *ih, int *iv, unsigned int *nc);
+static void getfacts(Monitor *m, int msize, int ssize, float *mf, float *sf, int *mr, int *sr);
 static void setlayout(const Arg *arg);
 static void setmfact(const Arg *arg);
 static void setup(void);
@@ -248,7 +260,6 @@ static char stext[256];
 static int screen;
 static int sw, sh;           /* X display screen geometry width, height */
 static int bh, blw = 0;      /* bar geometry */
-static int enablegaps = 1;   /* enables gaps, used by togglegaps */
 static int lrpad;            /* sum of left and right padding for text */
 static int (*xerrorxlib)(Display *, XErrorEvent *);
 static unsigned int numlockmask = 0;
@@ -279,6 +290,16 @@ static Window root, wmcheckwin;
 
 /* configuration, allows nested code to access above variables */
 #include "config.h"
+
+struct Pertag {
+	unsigned int curtag, prevtag; /* current and previous tag */
+	int nmasters[LENGTH(tags) + 1]; /* number of windows in master area */
+	float mfacts[LENGTH(tags) + 1]; /* mfacts per tag */
+	unsigned int sellts[LENGTH(tags) + 1]; /* selected layouts */
+	const Layout *ltidxs[LENGTH(tags) + 1][2]; /* matrix of tags and layouts indexes  */
+	int showbars[LENGTH(tags) + 1]; /* display bar for the current tag */
+	int enablegaps[LENGTH(tags) + 1]; /* display gaps for the current tag */
+};
 
 /* compile-time check if all tags fit into an unsigned int bit array. */
 struct NumTags { char limitexceeded[LENGTH(tags) > 31 ? -1 : 1]; };
@@ -640,6 +661,7 @@ Monitor *
 createmon(void)
 {
 	Monitor *m;
+	unsigned int i;
 
 	m = ecalloc(1, sizeof(Monitor));
 	m->tagset[0] = m->tagset[1] = 1;
@@ -654,6 +676,21 @@ createmon(void)
 	m->lt[0] = &layouts[0];
 	m->lt[1] = &layouts[1 % LENGTH(layouts)];
 	strncpy(m->ltsymbol, layouts[0].symbol, sizeof m->ltsymbol);
+	m->pertag = ecalloc(1, sizeof(Pertag));
+	m->pertag->curtag = m->pertag->prevtag = 1;
+
+	for (i = 0; i <= LENGTH(tags); i++) {
+		m->pertag->nmasters[i] = m->nmaster;
+		m->pertag->mfacts[i] = m->mfact;
+
+		m->pertag->ltidxs[i][0] = m->lt[0];
+		m->pertag->ltidxs[i][1] = m->lt[1];
+		m->pertag->sellts[i] = m->sellt;
+
+		m->pertag->showbars[i] = m->showbar;
+		m->pertag->enablegaps[i] = 1;
+	}
+
 	return m;
 }
 
@@ -979,7 +1016,16 @@ grabkeys(void)
 void
 incnmaster(const Arg *arg)
 {
+	unsigned int i;
 	selmon->nmaster = MAX(selmon->nmaster + arg->i, 0);
+	for(i=0; i<LENGTH(tags); ++i)
+		if(selmon->tagset[selmon->seltags] & 1<<i)
+			selmon->pertag->nmasters[i+1] = selmon->nmaster;
+	
+	if(selmon->pertag->curtag == 0)
+	{
+		selmon->pertag->nmasters[0] = selmon->nmaster;
+	}
 	arrange(selmon);
 }
 
@@ -1510,6 +1556,10 @@ setfullscreen(Client *c, int fullscreen)
 	}
 }
 
+#if !PERTAG_PATCH
+static int enablegaps = 1;
+#endif
+
 void
 setgaps(int gapw)
 {
@@ -1520,6 +1570,17 @@ setgaps(int gapw)
 	selmon->gappih = gapw;
 	selmon->gappiv = gapw;
 	arrange(selmon);
+}
+
+void
+togglegaps(const Arg *arg)
+{
+	#if PERTAG_PATCH
+	selmon->pertag->enablegaps[selmon->pertag->curtag] = !selmon->pertag->enablegaps[selmon->pertag->curtag];
+	#else
+	enablegaps = !enablegaps;
+	#endif // PERTAG_PATCH
+	arrange(NULL);
 }
 
 void
@@ -1535,13 +1596,75 @@ incrgaps(const Arg *arg)
 }
 
 void
+getgaps(Monitor *m, int *oh, int *ov, int *ih, int *iv, unsigned int *nc)
+{
+	unsigned int n, oe, ie;
+	#if PERTAG_PATCH
+	oe = ie = selmon->pertag->enablegaps[selmon->pertag->curtag];
+	#else
+	oe = ie = enablegaps;
+	#endif // PERTAG_PATCH
+	Client *c;
+
+	for (n = 0, c = nexttiled(m->clients); c; c = nexttiled(c->next), n++);
+	if (smartgaps && n == 1) {
+		oe = 0; // outer gaps disabled when only one client
+	}
+
+	*oh = m->gappoh*oe; // outer horizontal gap
+	*ov = m->gappov*oe; // outer vertical gap
+	*ih = m->gappih*ie; // inner horizontal gap
+	*iv = m->gappiv*ie; // inner vertical gap
+	*nc = n;            // number of clients
+}
+
+void
+getfacts(Monitor *m, int msize, int ssize, float *mf, float *sf, int *mr, int *sr)
+{
+	unsigned int n;
+	float mfacts, sfacts;
+	int mtotal = 0, stotal = 0;
+	Client *c;
+
+	for (n = 0, c = nexttiled(m->clients); c; c = nexttiled(c->next), n++);
+	mfacts = MIN(n, m->nmaster);
+	sfacts = n - m->nmaster;
+
+	for (n = 0, c = nexttiled(m->clients); c; c = nexttiled(c->next), n++)
+		if (n < m->nmaster)
+			mtotal += msize / mfacts;
+		else
+			stotal += ssize / sfacts;
+
+	*mf = mfacts; // total factor of master area
+	*sf = sfacts; // total factor of stack area
+	*mr = msize - mtotal; // the remainder (rest) of pixels after an even master split
+	*sr = ssize - stotal; // the remainder (rest) of pixels after an even stack split
+}
+
+void
 setlayout(const Arg *arg)
 {
+	unsigned int i;
 	if (!arg || !arg->v || arg->v != selmon->lt[selmon->sellt])
 		selmon->sellt ^= 1;
 	if (arg && arg->v)
 		selmon->lt[selmon->sellt] = (Layout *)arg->v;
 	strncpy(selmon->ltsymbol, selmon->lt[selmon->sellt]->symbol, sizeof selmon->ltsymbol);
+
+	for(i=0; i<LENGTH(tags); ++i)
+		if(selmon->tagset[selmon->seltags] & 1<<i)
+		{
+			selmon->pertag->ltidxs[i+1][selmon->sellt] = selmon->lt[selmon->sellt]; 
+			selmon->pertag->sellts[i+1] = selmon->sellt;
+		}
+	
+	if(selmon->pertag->curtag == 0)
+	{
+		selmon->pertag->ltidxs[0][selmon->sellt] = selmon->lt[selmon->sellt]; 
+		selmon->pertag->sellts[0] = selmon->sellt;
+	}
+
 	if (selmon->sel)
 		arrange(selmon);
 	else
@@ -1553,13 +1676,24 @@ void
 setmfact(const Arg *arg)
 {
 	float f;
+	unsigned int i;
 
 	if (!arg || !selmon->lt[selmon->sellt]->arrange)
 		return;
 	f = arg->f < 1.0 ? arg->f + selmon->mfact : arg->f - 1.0;
+	if (arg->f == 0.0)
+		f = mfact;
 	if (f < 0.05 || f > 0.95)
 		return;
 	selmon->mfact = f;
+	for(i=0; i<LENGTH(tags); ++i)
+		if(selmon->tagset[selmon->seltags] & 1<<i)
+			selmon->pertag->mfacts[i+1] = f;
+
+	if(selmon->pertag->curtag == 0)
+	{
+		selmon->pertag->mfacts[0] = f;
+	}
 	arrange(selmon);
 }
 
@@ -1707,44 +1841,332 @@ tagmon(const Arg *arg)
 	sendmon(selmon->sel, dirtomon(arg->i));
 }
 
-void
+/***
+ * Layouts
+ */
+
+static void
 tile(Monitor *m)
 {
-	unsigned int i, n, h, r, oe = enablegaps, ie = enablegaps, mw, my, ty;
+	unsigned int i, n;
+	int oh, ov, ih, iv;
+	int mx = 0, my = 0, mh = 0, mw = 0;
+	int sx = 0, sy = 0, sh = 0, sw = 0;
+	float mfacts, sfacts;
+	int mrest, srest;
 	Client *c;
 
-	for (n = 0, c = nexttiled(m->clients); c; c = nexttiled(c->next), n++);
+	getgaps(m, &oh, &ov, &ih, &iv, &n);
 	if (n == 0)
 		return;
 
-	if (smartgaps == n) {
-		oe = 0; // outer gaps disabled
+	sx = mx = m->wx + ov;
+	sy = my = m->wy + oh;
+	mh = m->wh - 2*oh - ih * (MIN(n, m->nmaster) - 1);
+	sh = m->wh - 2*oh - ih * (n - m->nmaster - 1);
+	sw = mw = m->ww - 2*ov;
+
+	if (m->nmaster && n > m->nmaster) {
+		sw = (mw - iv) * (1 - m->mfact);
+		mw = mw - iv - sw;
+		sx = mx + mw + iv;
 	}
 
-	if (n > m->nmaster)
-		mw = m->nmaster ? (m->ww + m->gappiv*ie) * m->mfact : 0;
-	else
-		mw = m->ww - 2*m->gappov*oe + m->gappiv*ie;
-	for (i = 0, my = ty = m->gappoh*oe, c = nexttiled(m->clients); c; c = nexttiled(c->next), i++)
+	getfacts(m, mh, sh, &mfacts, &sfacts, &mrest, &srest);
+
+	for (i = 0, c = nexttiled(m->clients); c; c = nexttiled(c->next), i++)
 		if (i < m->nmaster) {
-			r = MIN(n, m->nmaster) - i;
-			h = (m->wh - my - m->gappoh*oe - m->gappih*ie * (r - 1)) / r;
-			resize(c, m->wx + m->gappov*oe, m->wy + my, mw - (2*c->bw) - m->gappiv*ie, h - (2*c->bw), 0);
-			if (my + HEIGHT(c) + m->gappih*ie < m->wh)
-			my += HEIGHT(c) + m->gappih*ie;
+			resize(c, mx, my, mw - (2*c->bw), (mh / mfacts) + (i < mrest ? 1 : 0) - (2*c->bw), 0);
+			my += HEIGHT(c) + ih;
 		} else {
-			r = n - i;
-			h = (m->wh - ty - m->gappoh*oe - m->gappih*ie * (r - 1)) / r;
-			resize(c, m->wx + mw + m->gappov*oe, m->wy + ty, m->ww - mw - (2*c->bw) - 2*m->gappov*oe, h - (2*c->bw), 0);
-			if (ty + HEIGHT(c) + m->gappih*ie < m->wh)
-				ty += HEIGHT(c) + m->gappih*ie;
+			resize(c, sx, sy, sw - (2*c->bw), (sh / sfacts) + ((i - m->nmaster) < srest ? 1 : 0) - (2*c->bw), 0);
+			sy += HEIGHT(c) + ih;
+		}
+}
+
+static void
+bstack(Monitor *m)
+{
+	unsigned int i, n;
+	int oh, ov, ih, iv;
+	int mx = 0, my = 0, mh = 0, mw = 0;
+	int sx = 0, sy = 0, sh = 0, sw = 0;
+	float mfacts, sfacts;
+	int mrest, srest;
+	Client *c;
+
+	getgaps(m, &oh, &ov, &ih, &iv, &n);
+	if (n == 0)
+		return;
+
+	sx = mx = m->wx + ov;
+	sy = my = m->wy + oh;
+	sh = mh = m->wh - 2*oh;
+	mw = m->ww - 2*ov - iv * (MIN(n, m->nmaster) - 1);
+	sw = m->ww - 2*ov - iv * (n - m->nmaster - 1);
+
+	if (m->nmaster && n > m->nmaster) {
+		sh = (mh - ih) * (1 - m->mfact);
+		mh = mh - ih - sh;
+		sx = mx;
+		sy = my + mh + ih;
+	}
+
+	getfacts(m, mw, sw, &mfacts, &sfacts, &mrest, &srest);
+
+	for (i = 0, c = nexttiled(m->clients); c; c = nexttiled(c->next), i++) {
+		if (i < m->nmaster) {
+			resize(c, mx, my, (mw / mfacts) + (i < mrest ? 1 : 0) - (2*c->bw), mh - (2*c->bw), 0);
+			mx += WIDTH(c) + iv;
+		} else {
+			resize(c, sx, sy, (sw / sfacts) + ((i - m->nmaster) < srest ? 1 : 0) - (2*c->bw), sh - (2*c->bw), 0);
+			sx += WIDTH(c) + iv;
+		}
+	}
+}
+
+static void
+bstackhoriz(Monitor *m)
+{
+	unsigned int i, n;
+	int oh, ov, ih, iv;
+	int mx = 0, my = 0, mh = 0, mw = 0;
+	int sx = 0, sy = 0, sh = 0, sw = 0;
+	float mfacts, sfacts;
+	int mrest, srest;
+	Client *c;
+
+	getgaps(m, &oh, &ov, &ih, &iv, &n);
+	if (n == 0)
+		return;
+
+	sx = mx = m->wx + ov;
+	sy = my = m->wy + oh;
+	mh = m->wh - 2*oh;
+	sh = m->wh - 2*oh - ih * (n - m->nmaster - 1);
+	mw = m->ww - 2*ov - iv * (MIN(n, m->nmaster) - 1);
+	sw = m->ww - 2*ov;
+
+	if (m->nmaster && n > m->nmaster) {
+		sh = (mh - ih) * (1 - m->mfact);
+		mh = mh - ih - sh;
+		sy = my + mh + ih;
+		sh = m->wh - mh - 2*oh - ih * (n - m->nmaster);
+	}
+
+	getfacts(m, mw, sh, &mfacts, &sfacts, &mrest, &srest);
+
+	for (i = 0, c = nexttiled(m->clients); c; c = nexttiled(c->next), i++) {
+		if (i < m->nmaster) {
+			resize(c, mx, my, (mw / mfacts) + (i < mrest ? 1 : 0) - (2*c->bw), mh - (2*c->bw), 0);
+			mx += WIDTH(c) + iv;
+		} else {
+			resize(c, sx, sy, sw - (2*c->bw), (sh / sfacts) + ((i - m->nmaster) < srest ? 1 : 0) - (2*c->bw), 0);
+			sy += HEIGHT(c) + ih;
+		}
+	}
+}
+
+/*
+ * Centred master layout + gaps
+ * https://dwm.suckless.org/patches/centeredmaster/
+ */
+void
+centeredmaster(Monitor *m)
+{
+	unsigned int i, n;
+	int oh, ov, ih, iv;
+	int mx = 0, my = 0, mh = 0, mw = 0;
+	int lx = 0, ly = 0, lw = 0, lh = 0;
+	int rx = 0, ry = 0, rw = 0, rh = 0;
+	float mfacts = 0, lfacts = 0, rfacts = 0;
+	int mtotal = 0, ltotal = 0, rtotal = 0;
+	int mrest = 0, lrest = 0, rrest = 0;
+	Client *c;
+
+	getgaps(m, &oh, &ov, &ih, &iv, &n);
+	if (n == 0)
+		return;
+
+	/* initialize areas */
+	mx = m->wx + ov;
+	my = m->wy + oh;
+	mh = m->wh - 2*oh - ih * ((!m->nmaster ? n : MIN(n, m->nmaster)) - 1);
+	mw = m->ww - 2*ov;
+	lh = m->wh - 2*oh - ih * (((n - m->nmaster) / 2) - 1);
+	rh = m->wh - 2*oh - ih * (((n - m->nmaster) / 2) - ((n - m->nmaster) % 2 ? 0 : 1));
+
+	if (m->nmaster && n > m->nmaster) {
+		/* go mfact box in the center if more than nmaster clients */
+		if (n - m->nmaster > 1) {
+			/* ||<-S->|<---M--->|<-S->|| */
+			mw = (m->ww - 2*ov - 2*iv) * m->mfact;
+			lw = (m->ww - mw - 2*ov - 2*iv) / 2;
+			rw = (m->ww - mw - 2*ov - 2*iv) - lw;
+			mx += lw + iv;
+		} else {
+			/* ||<---M--->|<-S->|| */
+			mw = (mw - iv) * m->mfact;
+			lw = 0;
+			rw = m->ww - mw - iv - 2*ov;
+		}
+		lx = m->wx + ov;
+		ly = m->wy + oh;
+		rx = mx + mw + iv;
+		ry = m->wy + oh;
+	}
+
+	/* calculate facts */
+	for (n = 0, c = nexttiled(m->clients); c; c = nexttiled(c->next), n++) {
+		if (!m->nmaster || n < m->nmaster)
+			mfacts += 1;
+		else if ((n - m->nmaster) % 2)
+			lfacts += 1; // total factor of left hand stack area
+		else
+			rfacts += 1; // total factor of right hand stack area
+	}
+
+	for (n = 0, c = nexttiled(m->clients); c; c = nexttiled(c->next), n++)
+		if (!m->nmaster || n < m->nmaster)
+			mtotal += mh / mfacts;
+		else if ((n - m->nmaster) % 2)
+			ltotal += lh / lfacts;
+		else
+			rtotal += rh / rfacts;
+
+	mrest = mh - mtotal;
+	lrest = lh - ltotal;
+	rrest = rh - rtotal;
+
+	for (i = 0, c = nexttiled(m->clients); c; c = nexttiled(c->next), i++) {
+		if (!m->nmaster || i < m->nmaster) {
+			/* nmaster clients are stacked vertically, in the center of the screen */
+			resize(c, mx, my, mw - (2*c->bw), (mh / mfacts) + (i < mrest ? 1 : 0) - (2*c->bw), 0);
+			my += HEIGHT(c) + ih;
+		} else {
+			/* stack clients are stacked vertically */
+			if ((i - m->nmaster) % 2 ) {
+				resize(c, lx, ly, lw - (2*c->bw), (lh / lfacts) + ((i - 2*m->nmaster) < 2*lrest ? 1 : 0) - (2*c->bw), 0);
+				ly += HEIGHT(c) + ih;
+			} else {
+				resize(c, rx, ry, rw - (2*c->bw), (rh / rfacts) + ((i - 2*m->nmaster) < 2*rrest ? 1 : 0) - (2*c->bw), 0);
+				ry += HEIGHT(c) + ih;
+			}
+		}
+	}
+}
+
+void
+centeredfloatingmaster(Monitor *m)
+{
+	unsigned int i, n;
+	float mfacts, sfacts;
+	float mivf = 1.0; // master inner vertical gap factor
+	int oh, ov, ih, iv, mrest, srest;
+	int mx = 0, my = 0, mh = 0, mw = 0;
+	int sx = 0, sy = 0, sh = 0, sw = 0;
+	Client *c;
+
+	getgaps(m, &oh, &ov, &ih, &iv, &n);
+	if (n == 0)
+		return;
+
+	sx = mx = m->wx + ov;
+	sy = my = m->wy + oh;
+	sh = mh = m->wh - 2*oh;
+	mw = m->ww - 2*ov - iv*(n - 1);
+	sw = m->ww - 2*ov - iv*(n - m->nmaster - 1);
+
+	if (m->nmaster && n > m->nmaster) {
+		mivf = 0.8;
+		/* go mfact box in the center if more than nmaster clients */
+		if (m->ww > m->wh) {
+			mw = m->ww * m->mfact - iv*mivf*(MIN(n, m->nmaster) - 1);
+			mh = m->wh * 0.9;
+		} else {
+			mw = m->ww * 0.9 - iv*mivf*(MIN(n, m->nmaster) - 1);
+			mh = m->wh * m->mfact;
+		}
+		mx = m->wx + (m->ww - mw) / 2;
+		my = m->wy + (m->wh - mh - 2*oh) / 2;
+
+		sx = m->wx + ov;
+		sy = m->wy + oh;
+		sh = m->wh - 2*oh;
+	}
+
+	getfacts(m, mw, sw, &mfacts, &sfacts, &mrest, &srest);
+
+	for (i = 0, c = nexttiled(m->clients); c; c = nexttiled(c->next), i++)
+		if (i < m->nmaster) {
+			/* nmaster clients are stacked horizontally, in the center of the screen */
+			resize(c, mx, my, (mw / mfacts) + (i < mrest ? 1 : 0) - (2*c->bw), mh - (2*c->bw), 0);
+			mx += WIDTH(c) + iv*mivf;
+		} else {
+			/* stack clients are stacked horizontally */
+			resize(c, sx, sy, (sw / sfacts) + ((i - m->nmaster) < srest ? 1 : 0) - (2*c->bw), sh - (2*c->bw), 0);
+			sx += WIDTH(c) + iv;
+		}
+}
+
+/*
+ * Deck layout + gaps
+ * https://dwm.suckless.org/patches/deck/
+ */
+void
+deck(Monitor *m)
+{
+	unsigned int i, n;
+	int oh, ov, ih, iv;
+	int mx = 0, my = 0, mh = 0, mw = 0;
+	int sx = 0, sy = 0, sh = 0, sw = 0;
+	float mfacts, sfacts;
+	int mrest, srest;
+	Client *c;
+
+	getgaps(m, &oh, &ov, &ih, &iv, &n);
+	if (n == 0)
+		return;
+
+	sx = mx = m->wx + ov;
+	sy = my = m->wy + oh;
+	sh = mh = m->wh - 2*oh - ih * (MIN(n, m->nmaster) - 1);
+	sw = mw = m->ww - 2*ov;
+
+	if (m->nmaster && n > m->nmaster) {
+		sw = (mw - iv) * (1 - m->mfact);
+		mw = mw - iv - sw;
+		sx = mx + mw + iv;
+		sh = m->wh - 2*oh;
+	}
+
+	getfacts(m, mh, sh, &mfacts, &sfacts, &mrest, &srest);
+
+	if (n - m->nmaster > 0) /* override layout symbol */
+		snprintf(m->ltsymbol, sizeof m->ltsymbol, "D %d", n - m->nmaster);
+
+	for (i = 0, c = nexttiled(m->clients); c; c = nexttiled(c->next), i++)
+		if (i < m->nmaster) {
+			resize(c, mx, my, mw - (2*c->bw), (mh / mfacts) + (i < mrest ? 1 : 0) - (2*c->bw), 0);
+			my += HEIGHT(c) + ih;
+		} else {
+			resize(c, sx, sy, sw - (2*c->bw), sh - (2*c->bw), 0);
 		}
 }
 
 void
 togglebar(const Arg *arg)
 {
+	unsigned int i;
 	selmon->showbar = !selmon->showbar;
+	for(i=0; i<LENGTH(tags); ++i)
+		if(selmon->tagset[selmon->seltags] & 1<<i)
+			selmon->pertag->showbars[i+1] = selmon->showbar;
+
+	if(selmon->pertag->curtag == 0)
+	{
+		selmon->pertag->showbars[0] = selmon->showbar;
+	}
 	updatebarpos(selmon);
 	XMoveResizeWindow(dpy, selmon->barwin, selmon->wx, selmon->by, selmon->ww, bh);
 	arrange(selmon);
@@ -1783,9 +2205,33 @@ void
 toggleview(const Arg *arg)
 {
 	unsigned int newtagset = selmon->tagset[selmon->seltags] ^ (arg->ui & TAGMASK);
+	int i;
 
 	if (newtagset) {
 		selmon->tagset[selmon->seltags] = newtagset;
+
+		if (newtagset == ~0) {
+			selmon->pertag->prevtag = selmon->pertag->curtag;
+			selmon->pertag->curtag = 0;
+		}
+
+		/* test if the user did not select the same tag */
+		if (!(newtagset & 1 << (selmon->pertag->curtag - 1))) {
+			selmon->pertag->prevtag = selmon->pertag->curtag;
+			for (i = 0; !(newtagset & 1 << i); i++) ;
+			selmon->pertag->curtag = i + 1;
+		}
+
+		/* apply settings for this view */
+		selmon->nmaster = selmon->pertag->nmasters[selmon->pertag->curtag];
+		selmon->mfact = selmon->pertag->mfacts[selmon->pertag->curtag];
+		selmon->sellt = selmon->pertag->sellts[selmon->pertag->curtag];
+		selmon->lt[selmon->sellt] = selmon->pertag->ltidxs[selmon->pertag->curtag][selmon->sellt];
+		selmon->lt[selmon->sellt^1] = selmon->pertag->ltidxs[selmon->pertag->curtag][selmon->sellt^1];
+
+		if (selmon->showbar != selmon->pertag->showbars[selmon->pertag->curtag])
+			togglebar(NULL);
+
 		focus(NULL);
 		arrange(selmon);
 	}
@@ -2080,11 +2526,37 @@ updatewmhints(Client *c)
 void
 view(const Arg *arg)
 {
+	int i;
+	unsigned int tmptag;
+
 	if ((arg->ui & TAGMASK) == selmon->tagset[selmon->seltags])
 		return;
 	selmon->seltags ^= 1; /* toggle sel tagset */
-	if (arg->ui & TAGMASK)
+	if (arg->ui & TAGMASK) {
 		selmon->tagset[selmon->seltags] = arg->ui & TAGMASK;
+		selmon->pertag->prevtag = selmon->pertag->curtag;
+
+		if (arg->ui == ~0)
+			selmon->pertag->curtag = 0;
+		else {
+			for (i = 0; !(arg->ui & 1 << i); i++) ;
+			selmon->pertag->curtag = i + 1;
+		}
+	} else {
+		tmptag = selmon->pertag->prevtag;
+		selmon->pertag->prevtag = selmon->pertag->curtag;
+		selmon->pertag->curtag = tmptag;
+	}
+
+	selmon->nmaster = selmon->pertag->nmasters[selmon->pertag->curtag];
+	selmon->mfact = selmon->pertag->mfacts[selmon->pertag->curtag];
+	selmon->sellt = selmon->pertag->sellts[selmon->pertag->curtag];
+	selmon->lt[selmon->sellt] = selmon->pertag->ltidxs[selmon->pertag->curtag][selmon->sellt];
+	selmon->lt[selmon->sellt^1] = selmon->pertag->ltidxs[selmon->pertag->curtag][selmon->sellt^1];
+
+	if (selmon->showbar != selmon->pertag->showbars[selmon->pertag->curtag])
+		togglebar(NULL);
+
 	focus(NULL);
 	arrange(selmon);
 }

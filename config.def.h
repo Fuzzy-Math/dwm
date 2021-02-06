@@ -1,7 +1,7 @@
 /* See LICENSE file for copyright and license details. */
 
 /* appearance */
-static const unsigned int borderpx  = 2;        /* border pixel of windows */
+static const unsigned int borderpx  = 3;        /* border pixel of windows */
 static const unsigned int snap      = 32;       /* snap pixel */
 static const unsigned int gappw     = 7;       /* gap width between windows */
 static const int smartgaps          = 0;        /* 1 means no outer gap when there is only one window */
@@ -17,7 +17,7 @@ static const char col_cyan[]        = "#005577";
 static const char *colors[][3]      = {
 	/*               fg         bg         border   */
 	[SchemeNorm] = { col_gray3, col_gray1, col_gray2 },
-	[SchemeSel]  = { col_gray1, col_gray3, col_gray3  },
+	[SchemeSel]  = { col_gray1, col_gray3,  col_gray3  },
 };
 
 /* tagging */
@@ -41,8 +41,14 @@ static const int resizehints = 0;    /* 1 means respect size hints in tiled resi
 static const Layout layouts[] = {
 	/* symbol     arrange function */
 	{ "[]=",      tile },    /* first entry is default */
-	{ "><>",      NULL },    /* no layout function means floating behavior */
 	{ "[M]",      monocle },
+	{ "H[]",      deck },
+	{ "TTT",      bstack },
+	{ "===",      bstackhoriz },
+	{ "|M|",      centeredmaster },
+	{ ">M>",      centeredfloatingmaster },
+	{ "><>",      NULL },    /* no layout function means floating behavior */
+	{ NULL,       NULL },
 };
 
 /* key definitions */
@@ -79,19 +85,25 @@ static Key keys[] = {
 	{ MODKEY|ShiftMask,             XK_b,      togglebar,      {0} },
 	{ MODKEY,                       XK_j,      focusstack,     {.i = +1 } },
 	{ MODKEY,                       XK_k,      focusstack,     {.i = -1 } },
-	{ MODKEY,                       XK_i,      incnmaster,     {.i = +1 } },
-	{ MODKEY,                       XK_d,      incnmaster,     {.i = -1 } },
+	{ MODKEY|ShiftMask,             XK_i,      incnmaster,     {.i = +1 } },
+	{ MODKEY|ShiftMask,             XK_d,      incnmaster,     {.i = -1 } },
 	{ MODKEY,                       XK_h,      setmfact,       {.f = -0.05} },
 	{ MODKEY,                       XK_l,      setmfact,       {.f = +0.05} },
 	{ MODKEY|ControlMask,           XK_equal,  incrgaps,       {.i = +1 } },
 	{ MODKEY|ControlMask,           XK_minus,  incrgaps,       {.i = -1 } },
 	{ MODKEY|ControlMask,           XK_0,      defaultgaps,    {0} },
+	{ MODKEY|ShiftMask|ControlMask, XK_0,      togglegaps,    {0} },
 	{ MODKEY|ShiftMask,             XK_Return, zoom,           {0} },
 	{ MODKEY,                       XK_Tab,    view,           {0} },
 	{ MODKEY|ShiftMask,             XK_c,      killclient,     {0} },
 	{ MODKEY,                       XK_t,      setlayout,      {.v = &layouts[0]} },
-	{ MODKEY,                       XK_f,      setlayout,      {.v = &layouts[1]} },
-	{ MODKEY,                       XK_m,      setlayout,      {.v = &layouts[2]} },
+	{ MODKEY,                       XK_m,      setlayout,      {.v = &layouts[1]} },
+	{ MODKEY,                       XK_d,      setlayout,      {.v = &layouts[2]} },
+	{ MODKEY,                       XK_u,      setlayout,      {.v = &layouts[3]} },
+	{ MODKEY,                       XK_i,      setlayout,      {.v = &layouts[4]} },
+	{ MODKEY,                       XK_c,      setlayout,      {.v = &layouts[5]} },
+	{ MODKEY,                       XK_v,      setlayout,      {.v = &layouts[6]} },
+	{ MODKEY,                       XK_f,      setlayout,      {.v = &layouts[7]} },
 	{ MODKEY,                       XK_space,  setlayout,      {0} },
 	{ MODKEY|ShiftMask,             XK_space,  togglefloating, {0} },
 	{ MODKEY,                       XK_0,      view,           {.ui = ~0 } },
@@ -111,9 +123,7 @@ static Key keys[] = {
 	TAGKEYS(                        XK_9,                      8)
 	{ MODKEY|ShiftMask,             XK_q,      quit,           {0} },
 };
-
-/* button definitions */
-/* click can be ClkTagBar, ClkLtSymbol, ClkStatusText, ClkWinTitle, ClkClientWin, or ClkRootWin */
+/* button definitions */ /* click can be ClkTagBar, ClkLtSymbol, ClkStatusText, ClkWinTitle, ClkClientWin, or ClkRootWin */
 static Button buttons[] = {
 	/* click                event mask      button          function        argument */
 	{ ClkLtSymbol,          0,              Button1,        setlayout,      {0} },
